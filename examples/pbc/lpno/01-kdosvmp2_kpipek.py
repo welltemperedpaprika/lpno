@@ -19,7 +19,12 @@
 #         Timothy C. Berkelbach
 #
 
-'''kdOSVMP2 with KPM localization and frozen core.'''
+'''kdOSVMP2 with KPM localization and frozen core.
+
+NOTE: this example needs periodic Pipek-Mezey (pyscf.pbc.lo.kpipek), a
+localization code developed by Hong-Zhou Ye and Gengzhi Yang.
+For a stock-pyscf example, see 00-kpnomp2.py.
+'''
 
 import argparse
 import numpy as np
