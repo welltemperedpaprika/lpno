@@ -686,38 +686,126 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
         moe_lo = np.diag(foo)
         plans = {}
         pair_index = self._get_pair_index()
+        # The shared-half-product fast path reads the OSV overlaps and joint
+        # transforms directly and is exact only for the plain periodic PNO
+        # domain; subclasses (PAO basis) and test doubles keep the uniform
+        # per-entry get_ovlp construction.
+        fast = type(pair_domain) is pd_mod.PairDomain_kPNO
+        if fast:
+            osv = pair_domain.osv
+            S_osv = osv.S
+            w_all = pair_domain.w
+            nosv = osv.nosv
+
+        # ---- pass 1: entry metadata (source pair, Fock factor); no overlaps
+        meta = {}
         for i, j in pair_domain.loop_strong_pairs():
             k_list = self._k_lists_cache.get((i, j))
             if k_list is None:
                 k_list = pair_domain.loop_k(i, j, foo_mask)
-
-            entries = []
-            S_list = []
+            # each entry: (t2 key = translated source pair, original source
+            # orbitals for the S-block lookups, Fock factor).  get_ovlp uses
+            # the translated pair only for the w lookup; the OSV overlaps are
+            # between the orbitals in their true cells.
+            ent = []
             if i == j:
                 for k in k_list:
-                    t2_ik = self._get_residual_t2(t2, i, k)
-                    if k != i and foo_mask[k, i] and t2_ik is not None:
-                        S = pair_domain.get_ovlp(i, i, i, k)
-                        entries.append((S, (i, k), foo[k, i]))
-                        S_list.append(S)
+                    if (k != i and foo_mask[k, i]
+                            and self._get_residual_t2(t2, i, k) is not None):
+                        ent.append(((i, k), (i, k), foo[k, i]))
             else:
                 for k in k_list:
-                    t2_ik = self._get_residual_t2(t2, i, k)
-                    if k != j and foo_mask[k, j] and t2_ik is not None:
-                        S = pair_domain.get_ovlp(i, j, i, k)
-                        entries.append((S, (i, k), foo[k, j]))
-                        S_list.append(S)
-
+                    if (k != j and foo_mask[k, j]
+                            and self._get_residual_t2(t2, i, k) is not None):
+                        ent.append(((i, k), (i, k), foo[k, j]))
                     if k != i and foo_mask[i, k]:
                         k_ref, k_cell = pair_index.ref_cell(k)
-                        j_relative = pair_index.relative_lo(j, k_cell)
-                        t2_kj = self._get_residual_t2(t2, k_ref, j_relative)
-                        if t2_kj is not None:
-                            S = pair_domain.get_ovlp(i, j, k, j)
-                            entries.append((S, (k_ref, j_relative), foo[i, k]))
-                            S_list.append(S)
+                        j_rel = pair_index.relative_lo(j, k_cell)
+                        if self._get_residual_t2(t2, k_ref, j_rel) is not None:
+                            ent.append(((k_ref, j_rel), (k, j), foo[i, k]))
+            meta[(i, j)] = ent
 
-            S_concat_T = np.hstack(S_list).T.conj() if S_list else None
+        # ---- pass 2/3: shared half-products, then two fat GEMMs per target.
+        # H[x, src=(p,q)] = S_xp w_top + S_xq w_bot depends only on the row
+        # orbital and the SOURCE pair, so it is computed once and reused by
+        # every target pair that couples to that source (the old per-entry
+        # get_ovlp recomputed it per target: the 2026-07-27 Si A/B showed
+        # this construction is ~90% of the residual stage).  The target's
+        # transform is then applied to the hstacked halves in one GEMM per
+        # row, producing S_concat directly.
+        def osv_S(x, y):
+            blk = S_osv[max(x, y), min(x, y)]
+            if x < y:
+                blk = blk.T.conj()
+            return blk
+
+        H = {}
+
+        def get_H(x, t2key, orb):
+            # fast path only (guarded by `fast` at the call sites)
+            key = (x,) + orb
+            val = H.get(key)
+            if val is None:
+                p, q = t2key
+                ko, lo = orb
+                w = w_all[p][q]
+                wt = w[:nosv[p]]
+                wb = w[nosv[p]:]
+                Sxk = osv_S(x, ko)
+                val = lib.dot(Sxk, wt) if Sxk.size else None
+                if wb.shape[0]:
+                    Sxl = osv_S(x, lo)
+                    if Sxl.size:
+                        contrib = lib.dot(Sxl, wb)
+                        val = contrib if val is None else val + contrib
+                if val is None:
+                    val = np.zeros((nosv[x], w.shape[1]))
+                H[key] = val
+            return val
+
+        n_ent = 0
+        for (i, j), ent in meta.items():
+            entries = []
+            S_concat = None
+            if ent and fast:
+                n_ent += len(ent)
+                HI = np.hstack([get_H(i, t2key, orb)
+                                for t2key, orb, _ in ent])
+                w_tgt = w_all[i][j]
+                wt = w_tgt[:nosv[i]]
+                wb = w_tgt[nosv[i]:]
+                S_concat = lib.dot(wt.T.conj(), HI)
+                if wb.shape[0]:
+                    HJ = np.hstack([get_H(j, t2key, orb)
+                                    for t2key, orb, _ in ent])
+                    S_concat += lib.dot(wb.T.conj(), HJ)
+                offs_ = np.cumsum(
+                    [0] + [w_all[p][q].shape[1] for (p, q), _, _ in ent])
+                entries = [
+                    (S_concat[:, offs_[n]:offs_[n + 1]], t2key, f)
+                    for n, (t2key, _, f) in enumerate(ent)]
+            elif ent:
+                n_ent += len(ent)
+                S_cols = [pair_domain.get_ovlp(i, j, *orb)
+                          for _, orb, _ in ent]
+                S_concat = np.hstack(S_cols)
+                offs_ = np.cumsum([0] + [S.shape[1] for S in S_cols])
+                entries = [
+                    (S_concat[:, offs_[n]:offs_[n + 1]], t2key, f)
+                    for n, (t2key, _, f) in enumerate(ent)]
+            plans[(i, j)] = (entries, S_concat)
+
+        if fast:
+            logger.new_logger(self).info(
+                'residual plans: %d targets, %d entries, %d shared '
+                'half-products (sharing %.1fx)', len(meta), n_ent, len(H),
+                2.0 * n_ent / max(1, len(H)))
+        H = None
+
+        # ---- pass 4: per-plan statics (unchanged layout)
+        for (i, j), (entries, S_concat) in plans.items():
+            S_list = [S for S, _, _ in entries]
+            S_concat_T = S_concat.T.conj() if S_concat is not None else None
             t2_keys = [e[1] for e in entries]
             t2_is_fixed = [key not in t2 for key in t2_keys]
             K = pair_domain.K[i][j]
@@ -814,8 +902,17 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
         use_prepacked = getattr(self, 'use_stacked_residual', False)
         if use_prepacked:
             if self._residual_plans is None:
+                # The one-time plan construction (dominated by the PNO-PNO
+                # get_ovlp triple products in the joint-OSV dimensions) is
+                # logged separately: the 2026-07-26 Si 4^3 A/B showed it is
+                # ~90% of the 'Residual eqn' stage, and unlike the iteration
+                # it does not shrink with T_PNO.
+                t0 = logger.perf_counter()
                 self._residual_plans = self._build_residual_plans(
                     t2, pair_domain, foo_mask)
+                logger.new_logger(self).info(
+                    'residual plan build (PNO overlaps): %.2f s wall',
+                    logger.perf_counter() - t0)
 
         for i, j in pair_domain.loop_strong_pairs():
             if use_prepacked:
