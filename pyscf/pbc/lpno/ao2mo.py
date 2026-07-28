@@ -58,6 +58,8 @@ def get_eris(mylpno, vir_coeff=None, ovL=None, ovL_to_save=None):
         verbose=log.verbose,
         stdout=log.stdout,
     )
+    if isinstance(eris, _DFINCOREERIS_PBC):
+        eris._qblock_chunk = getattr(mylpno, 'pbc_qblock_chunk', 8)
     eris.build()
     return eris
 
@@ -112,7 +114,10 @@ class _DFINCOREERIS_PBC(K2SDF):
         """
         log = logger.new_logger(self)
         cput1 = (logger.process_clock(), logger.perf_counter())
-        if self._mode == 'outcore':
+        if self._mode == 'qblock':
+            if self._nlo_per_cell is not None and self._kscf is not None:
+                return self._build_qblock(log, cput1)
+        elif self._mode == 'outcore':
             if self._nlo_per_cell is not None and self._kscf is not None:
                 return self._build_outcore(log, cput1)
         elif self._mode == 'incore':
@@ -130,7 +135,7 @@ class _DFINCOREERIS_PBC(K2SDF):
                 return self._build_incore(log, cput1)
         else:
             raise ValueError(
-                f"unknown pbc_ao2mo_mode {self._mode!r}; choose 'incore' or 'outcore'"
+                f"unknown pbc_ao2mo_mode {self._mode!r}; choose 'incore', 'outcore' or 'qblock'"
             )
 
     def get_occ_blk(self, i0, i1):
@@ -183,6 +188,52 @@ class _DFINCOREERIS_PBC(K2SDF):
                     tmpI = lib.dot(UI, ovkR) + lib.dot(UR, ovkI)
                     blkR[idx, :, b0 : b0 + nauxq] += pf.real * tmpR - pf.imag * tmpI
                     blkI[idx, :, b0 : b0 + nauxq] += pf.real * tmpI + pf.imag * tmpR
+        return blkR, blkI
+
+    def _build_qblock(self, log, cput1):
+        """Retain only the compact k-space factors plus a ref-cell row cache;
+        the pair build consumes q-blocks via ``_reconstruct_qblock`` so the
+        supercell ``ovL`` tensor is never materialized (peak = one chunk of
+        q-slices plus the pair-K accumulators)."""
+        cput1 = self._build_kspace_data(log, cput1)
+        self.ovLR = None
+        self.ovLI = None
+        self._refcell_ovLR, self._refcell_ovLI = self._get_occ_blk_slow(
+            0, self._nlo_per_cell
+        )
+        log.timer(
+            'qblock ref-cell cache (%d orbitals)' % self._nlo_per_cell, *cput1
+        )
+
+    def _reconstruct_qblock(self, qi, j_ref):
+        """Supercell (ov|L) rows of orbital ``j_ref`` in every cell, for one
+        momentum-transfer block ``qi``: returns ``(blkR, blkI)`` of shape
+        ``(nkpts, nvir, nauxq)``.  Same math as one ``(qi, j_ref)`` sweep of
+        ``_build_incore`` (batched phase GEMM over all cells); requires the
+        k-space factors, which the ``qblock`` build keeps alive."""
+        nkpts = len(self.kpts)
+        nvir = self.nvir
+        b0, nauxq = self._qi_ranges[qi]
+        tR = np.empty((nkpts, nvir, nauxq))
+        tI = np.empty((nkpts, nvir, nauxq))
+        for ki in range(nkpts):
+            kj = self._kj_for_ki_qi[ki][qi]
+            ovkR = self._ovL_k_R[ki][j_ref, :, b0 : b0 + nauxq]
+            ovkI = self._ovL_k_I[ki][j_ref, :, b0 : b0 + nauxq]
+            U_kj = self._U_k[kj]
+            UR = U_kj.real.T
+            UI = U_kj.imag.T
+            tR[ki] = lib.dot(UR, ovkR) - lib.dot(UI, ovkI)
+            tI[ki] = lib.dot(UI, ovkR) + lib.dot(UR, ovkI)
+        pf = self._phase_factor
+        tR_2d = tR.reshape(nkpts, nvir * nauxq)
+        tI_2d = tI.reshape(nkpts, nvir * nauxq)
+        blkR = (lib.dot(pf.real, tR_2d) - lib.dot(pf.imag, tI_2d)).reshape(
+            nkpts, nvir, nauxq
+        )
+        blkI = (lib.dot(pf.real, tI_2d) + lib.dot(pf.imag, tR_2d)).reshape(
+            nkpts, nvir, nauxq
+        )
         return blkR, blkI
 
     def _project_blk(self, j, proj):

@@ -78,6 +78,8 @@ def _expand_trs_mf(kmf):
     return mf_bz, nkpts
 
 einsum = lib.einsum
+
+
 class KPNOMP2(pno_mp2_slow.PNOMP2):
     '''PNO-MP2 for periodic systems (k-point sampling).
 
@@ -109,7 +111,7 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
             (inherited from :class:`~pyscf.lpno.pnomp2.PNOMP2`).
         thresh_pno : float
             PNO truncation threshold.
-        pbc_ao2mo_mode : {'incore', 'outcore'}
+        pbc_ao2mo_mode : {'incore', 'outcore', 'qblock'}
             Strategy for building the periodic DF ERIs (default ``'incore'``).
         pbc_osv_mode : {'refcell', 'supercell', 'pao'}
             How the OSV virtual space is constructed (default ``'refcell'``).
@@ -178,13 +180,16 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
         self._t2_coupling = {}
         self.t2_clip_max = None
         self.pbc_ao2mo_mode = 'incore'
+        # qblock mode only: q-blocks contracted per sweep; peak build
+        # memory scales linearly with it
+        self.pbc_qblock_chunk = 8
         self.pbc_osv_mode = 'refcell'
         kpao_mp2_mod.set_default_options(self)
         self.use_stacked_residual = True
         self.use_scmp2_coupling = False
         self.enforce_coupling_closure = True
         self._apply_coupling_closure = False
-        self._keys = self._keys.union(['pbc_ao2mo_mode', 'pbc_osv_mode',
+        self._keys = self._keys.union(['pbc_ao2mo_mode', 'pbc_osv_mode', 'pbc_qblock_chunk',
                                        'enforce_coupling_closure',
                                        *kpao_mp2_mod.PAO_KEYS])
 
@@ -209,6 +214,8 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
         log = logger.new_logger(self, verbose)
         log.info('nlo_per_cell = %d', self.nlo_per_cell)
         log.info('pbc_ao2mo_mode = %s', self.pbc_ao2mo_mode)
+        if self.pbc_ao2mo_mode == 'qblock':
+            log.info('pbc_qblock_chunk = %d', self.pbc_qblock_chunk)
         log.info('pbc_osv_mode = %s', self.pbc_osv_mode)
         if self.pbc_osv_mode == 'pao':
             kpao_mp2_mod.dump_flags(self, log)

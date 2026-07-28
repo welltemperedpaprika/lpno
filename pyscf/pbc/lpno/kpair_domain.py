@@ -953,6 +953,9 @@ class PairDomain_kPNO(lib.StreamObject):
         self.build()
 
     def build(self):
+        builder = get_kpsv_eri
+        if getattr(self.eris, '_mode', None) == 'qblock':
+            builder = get_kpsv_eri_qblock
         (
             self.pair_mask_strong,
             self.e,
@@ -960,7 +963,7 @@ class PairDomain_kPNO(lib.StreamObject):
             self.K,
             self.epair_psv,
             self.epair_pno,
-        ) = get_kpsv_eri(
+        ) = builder(
             self.osv,
             self.eris,
             self.pair_mask,
@@ -1158,3 +1161,246 @@ class PairDomain_kPNO(lib.StreamObject):
             self._ovlp_cache[cache_key] = result
 
         return result
+
+
+def _classify_psv_pair(out, i, j, fac, epsv, wpsv, Kpsv, occ_energy,
+                       pno_param, thresh_weakpair, with_ex_ene,
+                       keep_weak_domains):
+    """Shared endgame of the PSV build for one pair: SC-MP2 energy,
+    weak/strong classification, and (for strong pairs) the PNO truncation.
+    ``out`` carries the result containers (strong_pair_mask, es/ws/Ks and
+    the four epair accumulator arrays).  Used identically by get_kpsv_eri
+    and get_kpsv_eri_qblock so the two builders cannot drift."""
+    with_pno = pno_param is not None
+    t2psv = Kpsv / (occ_energy[i] + occ_energy[j] - (epsv[:, None] + epsv))
+    ed = einsum("ab,ab->", t2psv, Kpsv).real
+    ex = -einsum("ab,ba->", t2psv, Kpsv).real if with_ex_ene else 0
+    eij_psv_os = ed * fac
+    eij_psv_ss = (ed + ex) * fac
+    eij_psv = eij_psv_os + eij_psv_ss
+
+    if abs(eij_psv) < thresh_weakpair:
+        out["epair_psv_os"][i, j] = eij_psv_os
+        out["epair_psv_ss"][i, j] = eij_psv_ss
+        out["strong_pair_mask"][i, j] = False
+        if keep_weak_domains:
+            out["es"][i][j] = epsv
+            out["ws"][i][j] = wpsv
+            out["Ks"][i][j] = Kpsv
+        return
+
+    out["strong_pair_mask"][i, j] = True
+    if with_pno:
+        epno, upno = get_pno1(Kpsv, t2psv, epsv, **pno_param)
+
+        wpno = lib.dot(wpsv, upno)
+        Kpno = reduce(lib.dot, (upno.T.conj(), Kpsv, upno))
+
+        Tpno = Kpno / (
+            occ_energy[i] + occ_energy[j] - (epno[:, None] + epno)
+        )
+        ed_pno = einsum("ab,ab->", Tpno, Kpno).real
+        ex_pno = -einsum("ab,ba->", Tpno, Kpno).real if with_ex_ene else 0
+        eij_pno_os = ed_pno * fac
+        eij_pno_ss = (ed_pno + ex_pno) * fac
+
+        out["epair_pno_os"][i, j] = eij_psv_os - eij_pno_os
+        out["epair_pno_ss"][i, j] = eij_psv_ss - eij_pno_ss
+
+        out["es"][i][j] = epno
+        out["ws"][i][j] = wpno
+        out["Ks"][i][j] = Kpno
+    else:
+        out["es"][i][j] = epsv
+        out["ws"][i][j] = wpsv
+        out["Ks"][i][j] = Kpsv
+
+
+def _joint_psv_eigh(osv, i, j, thresh_psv_lindep):
+    """Joint OSV Fock/overlap assembly + generalized eigenproblem for pair
+    (i, j); returns (epsv, wpsv, nosv_i)."""
+    nosv = osv.nosv
+    s = np.eye(nosv[i] + nosv[j])
+    s_ij = osv.S[max(i, j), min(i, j)]
+    if i > j:
+        s[: nosv[i], nosv[i] :] = s_ij
+        s[nosv[i] :, : nosv[i]] = s_ij.T.conj()
+    else:
+        s[: nosv[i], nosv[i] :] = s_ij.T.conj()
+        s[nosv[i] :, : nosv[i]] = s_ij
+    f = np.diag(np.hstack((osv.e[i], osv.e[j])))
+    f_ij = osv.F[max(i, j), min(i, j)]
+    if i > j:
+        f[: nosv[i], nosv[i] :] = f_ij
+        f[nosv[i] :, : nosv[i]] = f_ij.T.conj()
+    else:
+        f[: nosv[i], nosv[i] :] = f_ij.T.conj()
+        f[nosv[i] :, : nosv[i]] = f_ij
+    epsv, wpsv = safe_eigh(f, s, lindep_thr=thresh_psv_lindep)
+    return epsv, wpsv, nosv[i]
+
+
+def get_kpsv_eri_qblock(
+    osv,
+    eris,
+    pair_mask,
+    occ_energy,
+    vir_energy,
+    pno_param=None,
+    nlo_per_cell=None,
+    nlo=None,
+    thresh_psv_lindep=1e-6,
+    thresh_weakpair=0,
+    with_ex_ene=True,
+    compress_diagpair=False,
+    keep_weak_domains=False,
+):
+    """q-blocked PSV/PNO build: identical physics to :func:`get_kpsv_eri`
+    but the supercell (ov|L) tensor is never materialized.  Per momentum-
+    transfer block, one batch of rows is reconstructed from the k-space
+    factors, projected onto each pair's joint PSV basis, and the pair's
+    exchange matrix accumulated (the aux contraction is a plain sum over
+    q-blocks).  Peak memory is one q-slice plus the K accumulators, both
+    O(N_k^2) overall.  Requires ``eris`` built with mode='qblock'.
+    """
+    log = logger.new_logger(eris)
+    npc = nlo_per_cell
+    nkpts = nlo // npc
+    u = osv.u
+    nosv = osv.nosv
+
+    strong_pair_mask = np.zeros((npc, nlo), dtype=bool)
+    es = [{} for _ in range(npc)]
+    ws = [{} for _ in range(npc)]
+    Ks = [{} for _ in range(npc)]
+    epair_psv_ss = np.zeros((npc, nlo))
+    epair_psv_os = np.zeros((npc, nlo))
+    epair_pno_ss = np.zeros((npc, nlo))
+    epair_pno_os = np.zeros((npc, nlo))
+    out = {
+        "strong_pair_mask": strong_pair_mask,
+        "es": es, "ws": ws, "Ks": Ks,
+        "epair_psv_ss": epair_psv_ss, "epair_psv_os": epair_psv_os,
+        "epair_pno_ss": epair_pno_ss, "epair_pno_os": epair_pno_os,
+    }
+
+    # ---- pass 1: aux-independent joint-basis eigenproblems ----
+    pairs = []
+    diag_pairs = []
+    for i in range(npc):
+        for j in range(nlo):
+            if not pair_mask[i, j]:
+                continue
+            if i == j and not compress_diagpair:
+                diag_pairs.append(i)
+                continue
+            fac = 1 if i == j else 2
+            epsv, wpsv, ni = _joint_psv_eigh(osv, i, j, thresh_psv_lindep)
+            pairs.append((i, j, fac, epsv, wpsv, ni))
+    Kacc = {(i, j): np.zeros((wpsv.shape[1],) * 2)
+            for i, j, _, _, wpsv, _ in pairs}
+    Kdiag = {i: np.zeros((nosv[i],) * 2) for i in diag_pairs}
+    needed = sorted({p[0] for p in pairs} | {p[1] for p in pairs}
+                    | set(diag_pairs))
+    needed_set = set(needed)
+
+    # ---- pass 1.5: static row-batched projector stacks ----
+    # Every projection of row o is done as ONE GEMM per sweep against a
+    # stacked projector, then sliced per pair: each row is streamed once
+    # per sweep instead of once per coupled pair.  (The v2 build lost 3.6x
+    # to re-streaming the reference-cell rows per pair, ~500 partners each
+    # on MgO 5^3 -- the flop count was already half of incore's.)
+    # i-side stack for ref orbital i: [u_i | u_j for each partner j];
+    # j-side stack for supercell orbital j: [u_j | u_i for each ref i].
+    ipart = {i: [] for i in range(npc)}
+    jpart = {}
+    for i, j, _, _, _, _ in pairs:
+        ipart[i].append(j)
+        jpart.setdefault(j, []).append(i)
+    for i in diag_pairs:
+        ipart.setdefault(i, [])
+    iUT, ioff = {}, {}
+    for i, js in ipart.items():
+        if i not in needed_set:
+            continue
+        blocks = [u[i].T] + [u[j].T for j in js]
+        iUT[i] = np.ascontiguousarray(np.vstack(blocks))
+        offs_ = np.cumsum([0, nosv[i]] + [nosv[j] for j in js])
+        ioff[i] = {j: (offs_[k + 1], offs_[k + 2]) for k, j in enumerate(js)}
+        ioff[i][None] = (0, nosv[i])          # the diagonal block u_i
+    jUT, joff = {}, {}
+    for j, is_ in jpart.items():
+        blocks = [u[j].T] + [u[i].T for i in is_]
+        jUT[j] = np.ascontiguousarray(np.vstack(blocks))
+        offs_ = np.cumsum([0, nosv[j]] + [nosv[i] for i in is_])
+        joff[j] = {i: (offs_[k + 1], offs_[k + 2]) for k, i in enumerate(is_)}
+        joff[j][None] = (0, nosv[j])          # the diagonal block u_j
+
+    # ---- pass 2: accumulate K over chunks of momentum-transfer blocks ----
+    # Chunking is the memory/speed dial: contracting C q-blocks at once gives
+    # the projection GEMMs a contraction length C*nauxq (~100 per block), and
+    # MKL only reaches asymptotic throughput beyond a few hundred.  The
+    # single-block build (C=1) measured 3.9x slower than incore on MgO 5^3
+    # purely from skinny shapes; peak memory scales linearly with C.
+    nq = len(eris._qi_ranges)
+    chunk = max(1, min(nq, int(getattr(eris, "_qblock_chunk", 8))))
+    log.debug1("qblock PSV build: %d q-blocks (chunk %d), %d pairs, %d diag",
+               nq, chunk, len(pairs), len(diag_pairs))
+    for q0 in range(0, nq, chunk):
+        qis = range(q0, min(q0 + chunk, nq))
+        rows = {}
+        for j_ref in range(npc):
+            parts = [eris._reconstruct_qblock(qi, j_ref) for qi in qis]
+            blkR = np.concatenate([p[0] for p in parts], axis=2)
+            blkI = np.concatenate([p[1] for p in parts], axis=2)
+            parts = None
+            for T in range(nkpts):
+                o = T * npc + j_ref
+                if o in needed_set:
+                    rows[o] = (blkR[T], blkI[T])
+        # one fat GEMM per row per sweep, sliced per pair below
+        Xi = {i: (lib.dot(iUT[i], rows[i][0]), lib.dot(iUT[i], rows[i][1]))
+              for i in iUT if i in rows}
+        Xj = {j: (lib.dot(jUT[j], rows[j][0]), lib.dot(jUT[j], rows[j][1]))
+              for j in jUT}
+        for i, j, fac, epsv, wpsv, ni in pairs:
+            wt = wpsv[:ni]
+            wb = wpsv[ni:]
+            XiR, XiI = Xi[i]
+            XjR, XjI = Xj[j]
+            d0, d1 = ioff[i][None]
+            x0, x1 = ioff[i][j]
+            y0, y1 = joff[j][None]
+            z0, z1 = joff[j][i]
+            # upsv^T row_i = wt^T (u_i^T row_i) + wb^T (u_j^T row_i)
+            ALR = lib.dot(wt.T, XiR[d0:d1]) + lib.dot(wb.T, XiR[x0:x1])
+            ALI = lib.dot(wt.T, XiI[d0:d1]) + lib.dot(wb.T, XiI[x0:x1])
+            ARR = lib.dot(wt.T, XjR[z0:z1]) + lib.dot(wb.T, XjR[y0:y1])
+            ARI = lib.dot(wt.T, XjI[z0:z1]) + lib.dot(wb.T, XjI[y0:y1])
+            zdotCNtoR(ALR, ALI, ARR.T, ARI.T, 1, Kacc[(i, j)], 1)
+        for i in diag_pairs:
+            XiR, XiI = Xi[i]
+            d0, d1 = ioff[i][None]
+            zdotCNtoR(XiR[d0:d1], XiI[d0:d1], XiR[d0:d1].T, XiI[d0:d1].T,
+                      1, Kdiag[i], 1)
+        rows = Xi = Xj = None
+
+    # ---- pass 3: classify / truncate with the complete K ----
+    for i in diag_pairs:
+        es[i][i] = osv.e[i]
+        ws[i][i] = np.eye(u[i].shape[1])
+        Ks[i][i] = Kdiag[i]
+        strong_pair_mask[i, i] = True
+    for i, j, fac, epsv, wpsv, ni in pairs:
+        _classify_psv_pair(out, i, j, fac, epsv, wpsv, Kacc.pop((i, j)),
+                           occ_energy, pno_param, thresh_weakpair,
+                           with_ex_ene, keep_weak_domains)
+
+    epair_psv = lib.tag_array(
+        epair_psv_ss + epair_psv_os, e_corr_ss=epair_psv_ss, e_corr_os=epair_psv_os
+    )
+    epair_pno = lib.tag_array(
+        epair_pno_ss + epair_pno_os, e_corr_ss=epair_pno_ss, e_corr_os=epair_pno_os
+    )
+
+    return strong_pair_mask, es, ws, Ks, epair_psv, epair_pno
