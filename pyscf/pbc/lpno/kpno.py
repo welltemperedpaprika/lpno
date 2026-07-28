@@ -41,8 +41,27 @@ def _expand_trs_mf(kmf):
     '''Expand IBZ → full BZ if TRS KPoints detected. Returns (mf, nkpts).'''
     from pyscf.pbc.lib.kpts import KPoints
     kpts = kmf.kpts
-    if not isinstance(kpts, KPoints) or len(kpts) == kpts.nkpts:
+    if not isinstance(kpts, KPoints):
         return kmf, len(np.asarray(kpts).reshape(-1, 3))
+    if len(kpts) == kpts.nkpts:
+        # TRS KPoints whose IBZ already equals the full BZ (every point its
+        # own time-reversal image, e.g. any 2x2x2 mesh): no conjugate
+        # expansion needed, but downstream code requires a plain kpts array
+        # -- normalize the wrapper, mapping mo data into BZ order.
+        from pyscf.pbc import scf
+        order = np.asarray(kpts.bz2ibz, dtype=int)
+        mf_bz = scf.KRHF(kmf.cell, kpts=np.asarray(kpts.kpts)).density_fit(
+            auxbasis=kmf.with_df.auxbasis)
+        mf_bz.mo_coeff = [kmf.mo_coeff[x] for x in order]
+        mf_bz.mo_energy = [kmf.mo_energy[x] for x in order]
+        mf_bz.mo_occ = [kmf.mo_occ[x] for x in order]
+        mf_bz.e_tot = kmf.e_tot
+        mf_bz.converged = True
+        mf_bz.with_df = kmf.with_df
+        # KRHF.kpts proxies with_df.kpts; force the plain full-BZ array so
+        # no KPoints object leaks through the reused DF object
+        mf_bz.kpts = np.asarray(kpts.kpts)
+        return mf_bz, kpts.nkpts
 
     from pyscf.pbc.lo.base import remove_trs_mo
     from pyscf.pbc import scf
