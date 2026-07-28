@@ -676,7 +676,14 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
         return getattr(self, '_t2_coupling', {}).get((i, j))
 
     def _build_residual_plans(self, t2, pair_domain, foo_mask):
+        '''Pre-resolve all residual contributions for each strong pair.
+
+        Returns {(i,j): plan} where plan holds direct array references and
+        precomputed constants so the per-iteration residual avoids conditionals,
+        cache lookups, and index arithmetic.
+        '''
         foo = self.foo
+        moe_lo = np.diag(foo)
         plans = {}
         pair_index = self._get_pair_index()
         for i, j in pair_domain.loop_strong_pairs():
@@ -713,25 +720,76 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
             S_concat_T = np.hstack(S_list).T.conj() if S_list else None
             t2_keys = [e[1] for e in entries]
             t2_is_fixed = [key not in t2 for key in t2_keys]
-            fock_vals = np.ascontiguousarray(
-                [e[2] for e in entries], dtype=np.float64)
-            S_arrays_c = [np.ascontiguousarray(S) for S in S_list]
-            plans[(i, j)] = {
-                'K': pair_domain.K[i][j],
+            K = pair_domain.K[i][j]
+            try:
+                vij = pair_domain.e[i][j]
+                denom = moe_lo[i] + moe_lo[j] - (vij[:, None] + vij)
+            except (AttributeError, KeyError, TypeError):
+                denom = None
+            plan = {
+                'K': K,
+                'denom': denom,
                 'is_diag': i == j,
                 'entries': entries,
                 'S_concat_T': S_concat_T,
-                'S_arrays': S_arrays_c,
                 't2_keys': t2_keys,
                 't2_is_fixed': t2_is_fixed,
-                'fock_vals': fock_vals,
             }
+            # Lean-path statics: fold f_k into S_k^T once and preallocate the
+            # stacked B^T buffer, so the per-iteration inner loop is a single
+            # allocation-free GEMM per coupling entry.  Small-domain residuals
+            # are BLAS-dispatch bound, not flop bound; every Python call and
+            # temporary removed here is a direct wall-time saving.  Dispatch
+            # is size-hybrid: np.matmul for small entries (lib.dot carries a
+            # ~100 us call floor on the rusty python/MKL stack), lib.ddot for
+            # large entries and flop-heavy closing GEMMs (numpy's BLAS there
+            # runs ~5x slower than MKL at n >~ 150; measured 2026-07-26,
+            # bench job 6681399).
+            if entries and not (np.iscomplexobj(K)
+                                or any(np.iscomplexobj(S) for S in S_list)):
+                fST = [np.ascontiguousarray(f * S.T)
+                       for S, _, f in entries]
+                offs = np.cumsum([0] + [S.shape[1] for S in S_list])
+                plan['fST'] = fST
+                plan['offs'] = offs
+                plan['BT'] = np.empty((offs[-1], K.shape[0]))
+                plan['entry_big'] = [S.shape[1] >= 128 for S in S_list]
+                plan['close_libdot'] = (
+                    K.shape[0] ** 2 * offs[-1] >= 2e6)
+            plans[(i, j)] = plan
         return plans
 
     def _residual_prepacked(self, t2, plan):
+        '''Residual using precomputed plan — no conditionals or cache lookups.'''
         entries = plan['entries']
         if not entries:
             return plan['K'].copy()
+        BT = plan.get('BT')
+        if BT is not None:
+            # Lean path: BT[o_k:o_k+dk] = t2_k^T @ (f_k S_k)^T, written in
+            # place; the flops concentrate in the single closing GEMM.
+            # Per-entry GEMMs dispatch by size (see _build_residual_plans).
+            offs = plan['offs']
+            fST = plan['fST']
+            big = plan['entry_big']
+            is_diag = plan['is_diag']
+            get = self._get_residual_t2
+            for idx, key in enumerate(plan['t2_keys']):
+                t2_val = get(t2, *key)
+                if is_diag:
+                    t2_val = t2_val + t2_val.T
+                else:
+                    t2_val = t2_val.T
+                blk = BT[offs[idx]:offs[idx + 1]]
+                if big[idx]:
+                    lib.ddot(t2_val, fST[idx], 1, blk, 0)
+                else:
+                    np.matmul(t2_val, fST[idx], out=blk)
+            if plan['close_libdot']:
+                R = plan['K'] - lib.dot(BT.T, plan['S_concat_T'])
+            else:
+                R = plan['K'] - np.matmul(BT.T, plan['S_concat_T'])
+            return R
         R = plan['K'].copy()
         if plan['is_diag']:
             B_list = []
@@ -760,15 +818,21 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
                     t2, pair_domain, foo_mask)
 
         for i, j in pair_domain.loop_strong_pairs():
-            vij = pair_domain.e[i][j]
-            d = moe_lo[i] + moe_lo[j] - (vij[:, None] + vij)
             if use_prepacked:
-                R = self._residual_prepacked(t2new,
-                                             self._residual_plans[(i, j)])
+                plan = self._residual_plans[(i, j)]
+                d = plan['denom']
+                if d is None:
+                    vij = pair_domain.e[i][j]
+                    d = moe_lo[i] + moe_lo[j] - (vij[:, None] + vij)
+                R = self._residual_prepacked(t2new, plan)
+                R /= d
+                t2new[i, j] = R
             else:
+                vij = pair_domain.e[i][j]
+                d = moe_lo[i] + moe_lo[j] - (vij[:, None] + vij)
                 k_list = self._k_lists_cache.get((i, j))
                 R = self.residual(t2new, pair_domain, i, j, foo_mask, k_list)
-            t2new[i, j] = R / d
+                t2new[i, j] = R / d
 
             if self.t2_clip_max is not None:
                 t2_abs = np.abs(t2new[i, j])
@@ -777,7 +841,7 @@ class KPNOMP2(pno_mp2_slow.PNOMP2):
                     t2new[i, j] = t2new[i, j] * scale
 
         return t2new
-
+    
 
     def _finalize(self, timer):
         from pyscf.mp.mp2 import MP2
